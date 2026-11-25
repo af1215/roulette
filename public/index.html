@@ -1,27 +1,234 @@
-const http=require('http'),fs=require('fs'),path=require('path');
-const {WebSocketServer}=require('ws');
-const page=fs.readFileSync(path.join(__dirname,'public','index.html'));
-const server=http.createServer((req,res)=>{
-  if(req.url==='/health'){res.end('ok');return}
-  res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end(page);
-});
-const wss=new WebSocketServer({server,maxPayload:16*1024});
-const rooms=new Map();
-wss.on('connection',ws=>{
-  let room=null;
-  ws.isAlive=true;ws.on('pong',()=>{ws.isAlive=true});
-  ws.on('message',raw=>{
-    let m;try{m=JSON.parse(raw)}catch{return}
-    if(m.j&&!room){
-      const id=String(m.j).slice(0,8);
-      if(!rooms.has(id))rooms.set(id,new Set());
-      room=id;rooms.get(id).add(ws);
-      send(id,ws,{t:'__joined'});return;
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>룰렛 게임 온라인</title>
+<style>
+:root{--bg:#f4f1ea;--fg:#1d1b18;--card:#fff;--line:#d8d2c4;--red:#c0392b;--grn:#2e7d4f;--mut:#7a7467;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#151412;--fg:#ece7dc;--card:#201e1b;--line:#38342d;--red:#e5604f;--grn:#5cc58b;--mut:#9a9385}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#151412;--fg:#ece7dc;--card:#201e1b;--line:#38342d;--red:#e5604f;--grn:#5cc58b;--mut:#9a9385}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif}
+main{max-width:520px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:8px 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+button{font:inherit;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+button.p{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+button.d{border-color:var(--red);color:var(--red)}
+button:disabled{opacity:.4;cursor:default}
+input{font:inherit;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg);width:100%;box-sizing:border-box;margin-bottom:8px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1}
+.hp{font-size:22px;letter-spacing:2px}.mut{color:var(--mut);font-size:13px}
+.turn{outline:2px solid var(--grn)}
+.items button{flex:0 0 auto}
+#log{max-height:160px;overflow:auto;font-size:14px;line-height:1.6}
+.big{font-size:20px;font-weight:700;text-align:center;padding:8px}
+</style></head><body><main>
+<h1>🎲 룰렛 게임 온라인</h1>
+<div id="app"><div class="card">연결 중…</div></div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const MODES={
+ shot:{name:'🔫 샷건 룰렛',hit:'쏜다',self:'나에게 쏜다',shells:['공포탄','실탄'],hp:()=>2+rnd(3),
+  items:{mag:['🔍','돋보기','현재 탄 확인'],beer:['🍺','맥주','현재 탄 제거'],cig:['🚬','담배','HP +1'],saw:['🪚','톱','다음 발사 피해 x2']}},
+ drunk:{name:'🍺 술 룰렛',hit:'먹인다',self:'내가 마신다',shells:['물','맥주','소주','폭탄주'],hp:()=>5,
+  items:{mag:['🔍','돋보기','현재 잔 확인'],beer:['🗑️','버리기','현재 잔 버리기'],cig:['🍲','해장국','취기 -1'],saw:['🥃','더블샷','다음 잔 효과 x2']}}};
+MODES.propose={name:'💍 프러포즈',hit:'',self:'',shells:[],hp:()=>3,items:{}};
+const KEYS=['mag','beer','cig','saw'];
+const myId=Math.random().toString(36).slice(2,10);
+let R=null,isHost=false,myName='',code='',S=null,H=null,chamber=[],pickMode='shot';
+const rnd=n=>Math.floor(Math.random()*n);
+const M=()=>MODES[(S||H||{mode:pickMode}).mode];
+const alive=()=>H.players.filter(p=>p.alive);
+const mk=(id,name)=>({id,name,hp:0,max:0,items:[],saw:false,alive:true});
+
+async function enter(c,host){
+  try{R=await connect(c)}catch(e){$('#app').innerHTML='<div class="card">서버에 연결할 수 없어요.</div>';return}
+  code=c;isHost=host;
+  R.on('state',m=>{if(!isHost){S=m.data;render()}});
+  R.on('hello',m=>{if(isHost)onHello(m.data)});
+  R.on('act',m=>{if(isHost)onAct(m.data)});
+  R.onPeers(ch=>{if(isHost&&ch.joined.length)bcast()});
+  if(isHost){H={mode:pickMode,phase:'lobby',players:[mk(myId,myName)],turn:0,wins:[],log:[],round:0,loaded:'',left:0,peek:null};S={...H};render()}
+  else{S=null;render();hello();setInterval(()=>{if(!S||!S.players.some(p=>p.id===myId))hello()},2500)}
+}
+function connect(c){return new Promise((res,rej)=>{
+  const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host),h={};
+  ws.onopen=()=>{ws.send(JSON.stringify({j:c.toLowerCase()}));res({
+    on:(t,f)=>{h[t]=f},emit:(t,d)=>ws.send(JSON.stringify({t,d})),
+    onPeers:f=>{h.__joined=()=>f({joined:[1]})},ready:()=>ws.readyState===1})};
+  ws.onmessage=e=>{const m=JSON.parse(e.data);if(h[m.t])h[m.t]({data:m.d})};
+  ws.onclose=()=>{const a=$('#app');if(a)a.insertAdjacentHTML('afterbegin','<div class="card">연결이 끊겼어요. 새로고침해 주세요.</div>')};
+  ws.onerror=rej})}
+function hello(){if(R.ready())R.emit('hello',{id:myId,name:myName})}
+function bcast(){S={...H};R.emit('state',S);render()}
+function onHello(d){
+  if(!H.players.some(p=>p.id===d.id)&&H.phase==='lobby'&&H.players.length<(H.mode==='propose'?6:4)){H.players.push(mk(d.id,d.name));H.log=[d.name+' 님이 입장했어요']}
+  bcast();
+}
+function startGame(){if(H.mode==='propose'){startP();return}if(H.players.length<2)return;H.wins=H.players.map(()=>0);H.round=0;newRound()}
+function newRound(){
+  H.round++;const hp=M().hp();
+  H.players.forEach(p=>{p.hp=hp;p.max=hp;p.items=[];p.saw=false;p.alive=true});
+  H.phase='play';H.turn=rnd(H.players.length);reload();
+}
+function reload(){
+  const np=alive().length,n=2+rnd(7)+2*(np-2);
+  if(H.mode==='shot'){const live=1+rnd(n-1);chamber=[...Array(live).fill(1),...Array(n-live).fill(0)]}
+  else{chamber=Array.from({length:n},()=>{const r=rnd(100);return r<30?0:r<60?1:r<85?2:3});
+    if(chamber.every(v=>v===0))chamber[0]=1;if(chamber.every(v=>v>0))chamber[0]=0}
+  chamber.sort(()=>Math.random()-.5);
+  const c=MODES[H.mode].shells.map((_,v)=>chamber.filter(x=>x===v).length);
+  H.loaded=MODES[H.mode].shells.map((nm,v)=>c[v]?nm+' '+c[v]:'').filter(Boolean).join(' / ');
+  H.left=n;H.peek=null;
+  H.players.forEach(p=>{if(p.alive)for(let i=0;i<2&&p.items.length<6;i++)p.items.push(KEYS[rnd(4)])});
+  H.log.unshift('🔄 장전! '+H.loaded);bcast();
+}
+function next(from){const n=H.players.length;let i=from;do{i=(i+1)%n}while(!H.players[i].alive);return i}
+function onAct(a){
+  if(H.mode==='propose'){pAct(a);return}
+  if(H.phase!=='play')return;
+  const me=H.players.findIndex(p=>p.id===a.id);
+  if(me!==H.turn)return;
+  const P=H.players[me],m=MODES[H.mode],IT=m.items;
+  H.peek=null;
+  if(a.type==='item'){
+    const k=P.items[a.idx];if(!k)return;
+    if(k==='saw'&&P.saw)return;if(k==='cig'&&P.hp>=P.max)return;
+    P.items.splice(a.idx,1);const ic=IT[k][0];
+    if(k==='mag'){H.peek={id:P.id,val:chamber[0]};H.log.unshift(ic+' '+P.name+': 확인했다')}
+    if(k==='beer'){const s=chamber.shift();H.left--;H.log.unshift(ic+' '+P.name+': '+m.shells[s]+' 제거');if(!chamber.length){reload();return}}
+    if(k==='cig'){P.hp++;H.log.unshift(ic+' '+P.name+': 회복')}
+    if(k==='saw'){P.saw=true;H.log.unshift(ic+' '+P.name+': 다음 효과 x2')}
+    bcast();return;
+  }
+  if(a.type==='shoot'){
+    const t=a.t===me?me:a.t,V=H.players[t];if(!V||!V.alive)return;
+    const s=chamber.shift();H.left--;const dmg=s*(P.saw?2:1);P.saw=false;
+    V.hp=Math.max(0,V.hp-dmg);
+    H.log.unshift((H.mode==='shot'?'💥':'🥂')+' '+P.name+(t===me?' 본인':' → '+V.name)+': '+m.shells[s]+(dmg?' (-'+dmg+')':''));
+    if(V.hp<=0){V.alive=false;H.log.unshift('☠️ '+V.name+' 탈락!')}
+    if(alive().length===1){
+      const w=H.players.indexOf(alive()[0]);H.wins[w]++;H.log.unshift('🏅 '+H.players[w].name+' 라운드 승리');
+      if(H.wins[w]>=2){H.phase='over';bcast();return}
+      newRound();return;
     }
-    if(room&&typeof m.t==='string')send(room,ws,{t:m.t,d:m.d});
-  });
-  ws.on('close',()=>{if(room&&rooms.has(room)){rooms.get(room).delete(ws);if(!rooms.get(room).size)rooms.delete(room)}});
-});
-function send(id,from,msg){const s=JSON.stringify(msg);for(const c of rooms.get(id)||[])if(c!==from&&c.readyState===1)c.send(s)}
-setInterval(()=>{wss.clients.forEach(c=>{if(!c.isAlive)return c.terminate();c.isAlive=false;c.ping()})},30000);
-server.listen(process.env.PORT||3000,()=>console.log('listening'));
+    if(!(t===me&&s===0&&P.alive))H.turn=next(me);
+    if(!chamber.length){reload();return}
+    bcast();
+  }
+}
+function act(a){a.id=myId;if(isHost)onAct(a);else R.emit('act',a)}
+function meter(p){return S.mode==='shot'?'❤️'.repeat(p.hp)+'🖤'.repeat(p.max-p.hp):'취기 '+(p.max-p.hp)+'/'+p.max+' '+'🥴'.repeat(p.max-p.hp)+'🙂'.repeat(p.hp)}
+function render(){
+  const a=$('#app');
+  if(!R){a.innerHTML=`<div class="card"><input id="nm" placeholder="닉네임" maxlength="12" value="${esc(myName)}">
+  <div class="mut" style="margin-bottom:6px">게임 선택 (방 만들 때 적용)</div>
+  <div class="row" style="margin-bottom:8px">${Object.entries(MODES).map(([k,v])=>`<button data-m="${k}" class="${k===pickMode?'p':''}">${v.name}</button>`).join('')}</div>
+  <button class="p" id="mk" style="width:100%">방 만들기 (최대 4명)</button></div>
+  <div class="card"><input id="cd" placeholder="방 코드 (4글자)" maxlength="4" style="text-transform:uppercase"><button id="jn">방 입장</button></div>
+  <div class="mut">2~4인, 2선승. 🔫 샷건: 실탄에 맞으면 HP 감소. 🍺 술 룰렛: 물·맥주·소주·폭탄주 중 하나가 걸리고, 취기가 가득 차면 탈락. 자신에게 쏘거나 마셨는데 무해하면(공포탄/물) 한 번 더!</div>`;
+    const nm=()=>(myName=$('#nm').value.trim()||'플레이어'+rnd(99));
+    a.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>{nm();pickMode=b.dataset.m;render()});
+    $('#mk').onclick=()=>{nm();enter(Math.random().toString(36).slice(2,6).toUpperCase(),true)};
+    $('#jn').onclick=()=>{nm();const c=$('#cd').value.trim().toUpperCase();if(c.length===4)enter(c,false)};
+    return}
+  if(!S){a.innerHTML=`<div class="card">방 <b>${esc(code)}</b> 에 접속 중…<div class="mut">방장이 열려 있어야 해요.</div></div>`;return}
+  const m=MODES[S.mode],me=S.players.findIndex(p=>p.id===myId);
+  const head=`<div class="card row" style="align-items:center"><div>${m.name} · 방 코드 <b style="font-size:20px">${esc(code)}</b></div><button id="cp" style="flex:0">복사</button></div>`;
+  if(S.phase==='lobby'){
+    a.innerHTML=head+`<div class="card"><b>참가자 ${S.players.length}/${S.mode==='propose'?6:4}</b>${S.players.map(p=>'<div>• '+esc(p.name)+(p.id===myId?' (나)':'')+'</div>').join('')}
+    ${isHost?`<button class="p" id="go" style="width:100%;margin-top:8px" ${S.players.length<(S.mode==='propose'?3:2)?'disabled':''}>게임 시작</button>`:'<div class="mut">방장이 시작하길 기다리는 중…</div>'}</div>`;
+    wire();const g=document.getElementById('go');if(g)g.onclick=startGame;return}
+  if(me<0){a.innerHTML=head+`<div class="card">이미 시작됐거나 가득 찬 방이에요.</div>`;wire();return}
+  if(S.mode==='propose'){renderP(a,head,me);return}
+  const mp=S.players[me],mine=S.turn===me&&S.phase==='play'&&mp.alive;
+  const pk=S.peek&&S.peek.id===myId?`<div class="card big">🔍 현재: ${m.shells[S.peek.val]}</div>`:'';
+  let h=head+`<div class="card mut">라운드 ${S.round} · 승 ${S.players.map((p,i)=>esc(p.name)+' '+S.wins[i]).join(' / ')}<br>남은 ${S.left}개 (처음: ${S.loaded})</div>`;
+  S.players.forEach((p,i)=>{if(i!==me)h+=`<div class="card ${S.turn===i&&S.phase==='play'?'turn':''}" ${p.alive?'':'style="opacity:.45"'}><b>${esc(p.name)}</b>${p.saw?' ✨':''}${p.alive?'':' ☠️'}<div class="hp">${meter(p)}</div><div class="mut">아이템: ${p.items.map(k=>m.items[k][0]).join(' ')||'없음'}</div></div>`});
+  h+=pk;
+  if(S.phase==='over'){const w=S.wins.indexOf(Math.max(...S.wins));h+=`<div class="card big">${w===me?'🏆 승리!':'🏁 '+esc(S.players[w].name)+' 우승'}${isHost?'<div><button class="p" id="rm">다시 하기</button></div>':''}</div>`}
+  else h+=`<div class="card ${mine?'turn':''}"><b>${esc(mp.name)} (나)</b>${mp.saw?' ✨':''}${mp.alive?'':' ☠️ 탈락'}<div class="hp">${meter(mp)}</div>
+  <div class="big">${!mp.alive?'관전 중':mine?'내 차례!':esc(S.players[S.turn].name)+' 차례…'}</div>
+  <div class="row">${S.players.map((p,i)=>i!==me&&p.alive?`<button class="d" data-t="${i}" ${mine?'':'disabled'}>${esc(p.name)}에게 ${m.hit}</button>`:'').join('')}<button data-t="${me}" ${mine?'':'disabled'}>${m.self}</button></div>
+  <div class="row items" style="margin-top:8px">${mp.items.map((k,i)=>`<button data-i="${i}" ${mine?'':'disabled'} title="${m.items[k][2]}">${m.items[k][0]} ${m.items[k][1]}</button>`).join('')||'<span class="mut">아이템 없음</span>'}</div></div>`;
+  h+=`<div class="card" id="log">${S.log.slice(0,20).map(l=>'<div>'+esc(l)+'</div>').join('')}</div>`;
+  a.innerHTML=h;wire();
+  const rm=document.getElementById('rm');if(rm)rm.onclick=startGame;
+  a.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>act({type:'shoot',t:+b.dataset.t}));
+  a.querySelectorAll('[data-i]').forEach(b=>b.onclick=()=>act({type:'item',idx:+b.dataset.i}));
+}
+
+const WORDS="하늘만큼 별처럼 치킨 월급 내 마음 오늘부터 너의 눈웃음 김치찌개 커피 고양이 라면 주말 집 반지 웃어줘 손잡고 영원히 매일 같이 늦잠 떡볶이 로또 행복하게 보고싶어 퇴근 편의점 달 우주 심장 이불 살자 먹자 사줄게 지켜줄게 기다렸어 미안해 고마워 최고야 귀여워 멋져 세상에서 제일 진짜 완전 너만 나만 우리 내일 어제 방귀 뀌면서 콧구멍 발냄새 양말 한 짝 삼겹살 외계인 좀비 닭다리 민트초코 파인애플피자 오리 꽥꽥 코딱지 대머리 독수리 월요일 시금치 반찬 뜬금없이 갑자기 하마처럼 두더지 곰팡이 지렁이 숨바꼭질 야식 설사 트림 팔굽혀펴기 내 지갑 돌려줘 와이파이 비번 알려줘 환불 불가 택배 오늘만 사는 무한리필 전기장판 배달비 따봉 개그 쌍꺼풀 맹세코 어쩔티비 감자 고구마 부처님 영수증 석달 할부로 로딩중 서버 터짐 점심 메뉴 뭐 먹지 칼퇴 보장 ㅋㅋㅋㅋ 헐 대박 사건 눈치 없이 이불 킥 노래방 번호 따줘 새벽 3시에 알람 끄고 심쿵사 숨 참고 우주 먼지 걸레 짜듯이 닌자처럼 빛의 속도로 도망쳐 깜짝 몰래카메라".split(' ');
+const BASE=['나는','너를','사랑해','평생','함께','행복하게'];
+let tmr=null,curKey='',cdEnd=0,cdT=null,cur=[],sent=false;
+const shuffle=a=>a.map(x=>[Math.random(),x]).sort((x,y)=>x[0]-y[0]).map(x=>x[1]);
+function startP(){
+  if(H.players.length<3)return;
+  H.players.forEach(p=>p.rings=3);H.round=0;H.turn=rnd(H.players.length);H.deck=[];H.log=[];pRound();
+}
+function pRound(){
+  H.round++;H.phase='compose';H.hands={};H.subs={};H.dur=30;
+  H.players.forEach((p,i)=>{if(i===H.turn)return;
+    if(H.deck.length<6)H.deck=shuffle(WORDS.concat(H.deck));
+    H.hands[p.id]=H.deck.splice(0,6)});
+  H.log.unshift('💍 라운드 '+H.round+': 피앙세는 '+H.players[H.turn].name);
+  clearTimeout(tmr);tmr=setTimeout(toPick,(H.dur+5)*1000);bcast();
+}
+function toPick(){clearTimeout(tmr);if(H.phase!=='compose')return;H.phase='pick';bcast()}
+function pAct(a){
+  const me=H.players.findIndex(p=>p.id===a.id);if(me<0)return;
+  if(a.type==='submit'&&H.phase==='compose'&&me!==H.turn&&Array.isArray(a.w)){
+    H.subs[a.id]=a.w.slice(0,12).map(x=>String(x).slice(0,10));
+    if(Object.keys(H.subs).length>=H.players.length-1)toPick();else bcast();return}
+  if(a.type==='pick'&&H.phase==='pick'&&me===H.turn){
+    const t=a.t,V=H.players[t];if(!V||t===me||!H.subs[V.id])return;
+    V.rings--;H.log.unshift('💍 '+H.players[me].name+' 님이 '+V.name+' 님의 반지를 꼈어요! (남은 반지 '+V.rings+')');
+    if(V.rings<=0){H.phase='over';H.log.unshift('🏆 '+V.name+' 우승!');bcast();return}
+    H.turn=next(H.turn);pRound();
+  }
+}
+function sentence(w){return (w.length?w.join(' ')+' ':'')+'결혼하자 💍'}
+function renderP(a,head,me){
+  const fi=S.players[S.turn],isFi=me===S.turn;
+  let h=head+`<div class="card mut">라운드 ${S.round} · 피앙세 <b>${esc(fi.name)}</b><br>${S.players.map(p=>esc(p.name)+' '+'💍'.repeat(p.rings)).join(' / ')}</div>`;
+  if(S.phase==='over'){
+    const w=S.players.find(p=>p.rings<=0);
+    h+=`<div class="card big">${w&&w.id===myId?'🏆 승리!':'🏁 '+esc(w?w.name:'')+' 우승'}${isHost?'<div><button class="p" id="rm">다시 하기</button></div>':''}</div>`;
+  }else if(S.phase==='compose'){
+    if(isFi)h+=`<div class="card big">🙈 고개를 돌리고 기다려요…<div class="mut" style="font-weight:400">제출 ${Object.keys(S.subs).length}/${S.players.length-1}</div></div>`;
+    else{
+      const key=S.round+'-'+S.turn;
+      if(key!==curKey){curKey=key;cur=[];sent=false;cdEnd=Date.now()+S.dur*1000;clearInterval(cdT);
+        cdT=setInterval(()=>{const left=Math.max(0,Math.ceil((cdEnd-Date.now())/1000));const e=document.getElementById('cd');if(e)e.textContent=left+'초';
+          if(left<=0){clearInterval(cdT);if(!sent)submit()}},500)}
+      const L=BASE.concat(S.hands[myId]||[]);
+      h+=`<div class="card"><div class="big">⏱ <span id="cd">${Math.max(0,Math.ceil((cdEnd-Date.now())/1000))}초</span></div>
+      <div class="mut">단어를 눌러 문장을 만드세요 (피앙세에게 제출)</div>
+      <div class="row items" style="margin:8px 0">${L.map((w,i)=>`<button data-w="${i}" ${cur.includes(i)||sent?'disabled':''}>${esc(w)}</button>`).join('')}</div>
+      <div class="card" style="min-height:24px">${esc(sentence(cur.map(i=>L[i])))}</div>
+      <div class="row"><button id="clr" ${sent?'disabled':''}>지우기</button><button class="p" id="sub" ${sent?'disabled':''}>${sent?'제출됨 ✔':'제출'}</button></div></div>`;
+    }
+  }else{
+    h+=`<div class="card"><b>프러포즈 도착! ${isFi?'가장 마음에 드는 사람을 고르세요':'피앙세가 고르는 중…'}</b></div>`;
+    S.players.forEach((p,i)=>{if(i===S.turn)return;const w=S.subs[p.id];
+      h+=`<div class="card"><b>${esc(p.name)}</b><div style="margin:6px 0">${w?esc(sentence(w)):'<span class="mut">(제출 안 함)</span>'}</div>${isFi&&w?`<button class="p" data-p="${i}">이 사람 선택 💍</button>`:''}</div>`});
+  }
+  h+=`<div class="card" id="log">${S.log.slice(0,20).map(l=>'<div>'+esc(l)+'</div>').join('')}</div>`;
+  a.innerHTML=h;wire();
+  const g=id=>document.getElementById(id);
+  if(g('rm'))g('rm').onclick=startGame;
+  const L=BASE.concat((S.hands&&S.hands[myId])||[]);
+  a.querySelectorAll('[data-w]').forEach(b=>b.onclick=()=>{cur.push(+b.dataset.w);render()});
+  if(g('clr'))g('clr').onclick=()=>{cur=[];render()};
+  if(g('sub'))g('sub').onclick=submit;
+  a.querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>act({type:'pick',t:+b.dataset.p}));
+}
+function submit(){
+  if(sent||!S||S.phase!=='compose')return;
+  const L=BASE.concat(S.hands[myId]||[]);sent=true;
+  act({type:'submit',w:cur.map(i=>L[i])});render();
+}
+function wire(){const c=document.getElementById('cp');if(c)c.onclick=()=>{try{navigator.clipboard.writeText(code);c.textContent='복사됨'}catch(e){c.textContent=code}}}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+render();
+</script></body></html>
